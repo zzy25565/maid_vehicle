@@ -529,12 +529,17 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         if (isValidTarget(ownerTarget, maid, owner, vehicle)) {
             return ownerTarget;
         }
-        // 2) 最近攻击主人的敌人
+        // 2) 最近攻击女仆自己的目标（挨打了要还手，否则被流弹打只能干挨）
+        LivingEntity maidAttacker = maid.getLastHurtByMob();
+        if (isValidTarget(maidAttacker, maid, owner, vehicle)) {
+            return maidAttacker;
+        }
+        // 3) 最近攻击主人的敌人
         LivingEntity ownerAttacker = owner.getLastHurtByMob();
         if (isValidTarget(ownerAttacker, maid, owner, vehicle)) {
             return ownerAttacker;
         }
-        // 3) 载具附近最近的敌对生物
+        // 4) 载具附近最近的敌对生物
         AABB box = vehicle.getBoundingBox().inflate(TARGET_SEARCH_RANGE, 16, TARGET_SEARCH_RANGE);
         LivingEntity best = null;
         double bestDistSq = Double.MAX_VALUE;
@@ -560,7 +565,10 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         if (vehicle.distanceToSqr(t) > TARGET_MAX_RANGE * TARGET_MAX_RANGE) {
             return false;
         }
-        return t instanceof Enemy || t == owner.getLastHurtMob() || t == owner.getLastHurtByMob();
+        return t instanceof Enemy
+                || t == owner.getLastHurtMob()
+                || t == owner.getLastHurtByMob()
+                || t == maid.getLastHurtByMob();
     }
 
     private void setTarget(EntityMaid maid, @Nullable LivingEntity target) {
