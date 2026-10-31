@@ -3,6 +3,7 @@ package com.zzy.maidvehicle.ai;
 import com.atsuishio.superbwarfare.data.vehicle.subdata.EngineType;
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -11,7 +12,9 @@ import net.minecraft.world.entity.ai.behavior.Behavior;
 import net.minecraft.world.entity.ai.behavior.BehaviorUtils;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import org.jetbrains.annotations.Nullable;
@@ -59,6 +62,15 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     private static final int GIVE_UP_IDLE_TICKS = 200;
     private static final int ENERGY_CHECK_INTERVAL = 40;
 
+    /** 寻路重规划周期（tick） */
+    private static final int REPLAN_INTERVAL = 30;
+    /** 目标移动超过该距离（格）时立刻重规划 */
+    private static final double REPLAN_GOAL_MOVE = 6.0;
+    /** 航点到达判定半径（格） */
+    private static final double WAYPOINT_REACHED = 3.5;
+    /** 该距离内不论视线如何都停车（防止载具视点异常导致绕圈） */
+    private static final double FORCE_STOP_DIST = 8.0;
+
     // ===== 选车优先级（用户定稿）=====
     private static final int PRI_EMPTY_VEHICLE = 1;
     private static final int PRI_OWNER_WITH_WEAPON = 2;
@@ -79,6 +91,13 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     private int energyCache = Integer.MAX_VALUE;
     @Nullable
     private Vec3 lastVehiclePos = null;
+
+    // ===== 寻路状态 =====
+    private List<BlockPos> path = List.of();
+    private int pathIndex = 0;
+    private int replanTimer = 0;
+    @Nullable
+    private BlockPos lastGoal = null;
 
     public DriveVehicleBehavior() {
         // 10 分钟超时上限（超时会 stop 再 start，字段保留，无缝续跑）
@@ -111,7 +130,7 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
                 return;
             }
             if (vehicle.getFirstPassenger() == maid) {
-                driveTowardOwner(maid, vehicle, owner);
+                driveTowardOwner(level, maid, vehicle, owner);
             } else {
                 applyKeys(vehicle, (short) 0);
             }
@@ -141,13 +160,17 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         stuckAttempts = 0;
         giveUpTicks = 0;
         lastVehiclePos = null;
+        path = List.of();
+        pathIndex = 0;
+        replanTimer = 0;
+        lastGoal = null;
     }
 
     // =====================================================================
     // 驾驶
     // =====================================================================
 
-    private void driveTowardOwner(EntityMaid maid, VehicleEntity vehicle, LivingEntity owner) {
+    private void driveTowardOwner(ServerLevel level, EntityMaid maid, VehicleEntity vehicle, LivingEntity owner) {
         if (giveUpTicks > 0) {
             giveUpTicks--;
             applyKeys(vehicle, (short) 0);
@@ -168,7 +191,7 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         // 脱困倒车阶段：倒车 + 反向转向
         if (reverseTicks > 0) {
             reverseTicks--;
-            short key = pickTurnKey(vehicle, owner, true);
+            short key = pickTurnKey(vehicle, owner.getX(), owner.getZ(), true);
             applyKeys(vehicle, (short) (KEY_BACK | key));
             return;
         }
@@ -177,14 +200,55 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         double dz = owner.getZ() - vehicle.getZ();
         double distSq = dx * dx + dz * dz;
 
-        if (distSq <= FOLLOW_STOP_DIST * FOLLOW_STOP_DIST) {
+        // 到了：贴脸（任何情况）或进入跟随距离且能直视
+        if (distSq <= FORCE_STOP_DIST * FORCE_STOP_DIST
+                || (distSq <= FOLLOW_STOP_DIST * FOLLOW_STOP_DIST && hasClearLine(level, vehicle, owner))) {
             applyKeys(vehicle, (short) 0);
             resetStuck();
+            path = List.of();
+            pathIndex = 0;
             return;
         }
 
-        short keys = pickTurnKey(vehicle, owner, false);
-        float yawErrAbs = Math.abs(yawError(vehicle, dx, dz));
+        // 规划 / 重规划（巷道绕障的核心）
+        BlockPos goalPos = owner.blockPosition();
+        boolean needReplan = path.isEmpty()
+                || pathIndex >= path.size()
+                || replanTimer <= 0
+                || lastGoal == null
+                || lastGoal.distSqr(goalPos) > REPLAN_GOAL_MOVE * REPLAN_GOAL_MOVE;
+        if (needReplan) {
+            path = VehiclePathfinder.findPath(level, vehicle, owner);
+            pathIndex = 0;
+            replanTimer = REPLAN_INTERVAL;
+            lastGoal = goalPos;
+        }
+
+        double targetX;
+        double targetZ;
+        if (path.isEmpty()) {
+            // 无路可走：退回直线追踪（靠卡住脱困兜底）
+            targetX = owner.getX();
+            targetZ = owner.getZ();
+        } else {
+            // 推进已到达的航点
+            while (pathIndex < path.size() - 1 && reachedWaypoint(vehicle, path.get(pathIndex))) {
+                pathIndex++;
+            }
+            BlockPos wp = path.get(Math.min(pathIndex, path.size() - 1));
+            targetX = wp.getX() + 0.5;
+            targetZ = wp.getZ() + 0.5;
+            // 最后一段：主人已在停车距离内且能直视，直接停车
+            if (distSq <= FOLLOW_STOP_DIST * FOLLOW_STOP_DIST && hasClearLine(level, vehicle, owner)) {
+                applyKeys(vehicle, (short) 0);
+                resetStuck();
+                return;
+            }
+        }
+        replanTimer--;
+
+        short keys = pickTurnKey(vehicle, targetX, targetZ, false);
+        float yawErrAbs = Math.abs(yawErrorTo(vehicle, targetX, targetZ));
         if (yawErrAbs < TURN_MAX_BEFORE_FORWARD) {
             keys |= KEY_FORWARD;
         }
@@ -192,8 +256,24 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         detectStuck(vehicle, keys);
     }
 
-    /** 计算朝向主人的 yaw 误差（度，wrap 后）。 */
-    private static float yawError(VehicleEntity vehicle, double dx, double dz) {
+    private static boolean reachedWaypoint(VehicleEntity vehicle, BlockPos wp) {
+        double dx = wp.getX() + 0.5 - vehicle.getX();
+        double dz = wp.getZ() + 0.5 - vehicle.getZ();
+        return dx * dx + dz * dz <= WAYPOINT_REACHED * WAYPOINT_REACHED;
+    }
+
+    /** 两实体视点之间是否有方块阻挡（1.21.1 没有 Entity#hasLineOfSight）。 */
+    private static boolean hasClearLine(ServerLevel level, Entity from, Entity to) {
+        Vec3 start = from.getEyePosition();
+        Vec3 end = to.getEyePosition();
+        ClipContext ctx = new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, from);
+        return level.clip(ctx).getType() == HitResult.Type.MISS;
+    }
+
+    /** 计算朝向目标点的 yaw 误差（度，wrap 后）。 */
+    private static float yawErrorTo(VehicleEntity vehicle, double targetX, double targetZ) {
+        double dx = targetX - vehicle.getX();
+        double dz = targetZ - vehicle.getZ();
         // MC 实体 yaw：0=+Z，90=-X；朝向 (dx,dz) 需要 yaw = atan2(-dx, dz)
         float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
         return Mth.wrapDegrees(targetYaw - vehicle.getYRot());
@@ -203,10 +283,8 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
      * 依据 yaw 误差取转向键。MC 中 yaw 增大 = 车头右转（南→西为左转，yaw 减小），
      * 故 err &gt; 0 打右键；若实测转向相反，只需交换两个返回值。
      */
-    private short pickTurnKey(VehicleEntity vehicle, LivingEntity owner, boolean invert) {
-        double dx = owner.getX() - vehicle.getX();
-        double dz = owner.getZ() - vehicle.getZ();
-        float yawErr = yawError(vehicle, dx, dz);
+    private short pickTurnKey(VehicleEntity vehicle, double targetX, double targetZ, boolean invert) {
+        float yawErr = yawErrorTo(vehicle, targetX, targetZ);
         if (invert) {
             yawErr = -yawErr;
         }
@@ -239,6 +317,10 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
                 if (stuckAttempts < MAX_STUCK_ATTEMPTS) {
                     stuckAttempts++;
                     reverseTicks = REVERSE_TICKS;
+                    // 撞墙大概率说明当前路径不可行：丢掉路径强制重规划
+                    path = List.of();
+                    pathIndex = 0;
+                    replanTimer = 0;
                 } else {
                     // 连续脱困失败：原地休眠 10 秒再试（大概率没油或被地形卡死）
                     giveUpTicks = GIVE_UP_IDLE_TICKS;
