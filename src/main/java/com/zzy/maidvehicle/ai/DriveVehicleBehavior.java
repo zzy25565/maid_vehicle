@@ -49,10 +49,8 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
 
     // ===== 可调参数 =====
     private static final int SCAN_INTERVAL = 10;
-    private static final double FOLLOW_STOP_DIST = 12.0;
     private static final double BOARDING_DIST = 3.5;
-    private static final float TURN_DEADZONE = 3.0f;
-    private static final float TURN_MAX_BEFORE_FORWARD = 45.0f;
+    private static final double FORCE_STOP_DIST = 8.0;
     private static final double VEHICLE_SCAN_RANGE = 48.0;
     private static final double TARGET_SEARCH_RANGE = 48.0;
     private static final double TARGET_MAX_RANGE = 96.0;
@@ -66,10 +64,36 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     private static final int REPLAN_INTERVAL = 30;
     /** 目标移动超过该距离（格）时立刻重规划 */
     private static final double REPLAN_GOAL_MOVE = 6.0;
-    /** 航点到达判定半径（格） */
-    private static final double WAYPOINT_REACHED = 3.5;
-    /** 该距离内不论视线如何都停车（防止载具视点异常导致绕圈） */
-    private static final double FORCE_STOP_DIST = 8.0;
+
+    /**
+     * 按引擎类型分化的驾驶参数。
+     *
+     * <p>SBW 物理差异（源码实证）：
+     * <ul>
+     *   <li>履带 {@code trackEngine}：{@code yRot -= 8.0 * deltaRot}，转向不依赖速度 → 能原地转；</li>
+     *   <li>轮式 {@code wheelEngine}：{@code yRot -= max(12 * 水平速度, 0) * rudder}，转向 ∝ 速度
+     *       → 静止打方向无效，必须带油门才能转弯；倒车时转向自动反向（SBW 已处理）。</li>
+     * </ul>
+     *
+     * @param turnDeadzone     转向死区（度）
+     * @param pivotYawLimit    超过该角度误差时履带原地转向（不踩油门）
+     * @param stopDist         跟随停车距离（格）
+     * @param coastDist        滑行松油距离（格，轮式高速防过冲；0 = 不减速）
+     * @param waypointReach    航点到达判定半径（格）
+     * @param pivotInPlace     是否允许原地转向
+     * @param maxPivotTicks    原地转向超时（超过则强制给油防止卡死）
+     */
+    private record DriveProfile(float turnDeadzone, float pivotYawLimit, double stopDist,
+                                double coastDist, double waypointReach,
+                                boolean pivotInPlace, int maxPivotTicks) {
+    }
+
+    /** 履带：可原地转向，转向精确，可贴脸停车 */
+    private static final DriveProfile TRACK_PROFILE =
+            new DriveProfile(3.0F, 45.0F, 12.0, 0.0, 3.5, true, 60);
+    /** 轮式 / 船 / 轮椅：转向依赖速度，必须边走边转；转弯半径大，提前滑行减速 */
+    private static final DriveProfile WHEEL_PROFILE =
+            new DriveProfile(5.0F, 120.0F, 14.0, 26.0, 5.0, false, 0);
 
     // ===== 选车优先级（用户定稿）=====
     private static final int PRI_EMPTY_VEHICLE = 1;
@@ -98,6 +122,8 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     private int replanTimer = 0;
     @Nullable
     private BlockPos lastGoal = null;
+    /** 原地转向计时（履带专用，防止原地卡死） */
+    private int pivotTicks = 0;
 
     public DriveVehicleBehavior() {
         // 10 分钟超时上限（超时会 stop 再 start，字段保留，无缝续跑）
@@ -164,6 +190,7 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         pathIndex = 0;
         replanTimer = 0;
         lastGoal = null;
+        pivotTicks = 0;
     }
 
     // =====================================================================
@@ -171,6 +198,8 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     // =====================================================================
 
     private void driveTowardOwner(ServerLevel level, EntityMaid maid, VehicleEntity vehicle, LivingEntity owner) {
+        DriveProfile profile = profileFor(vehicle);
+
         if (giveUpTicks > 0) {
             giveUpTicks--;
             applyKeys(vehicle, (short) 0);
@@ -188,10 +217,10 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
             return;
         }
 
-        // 脱困倒车阶段：倒车 + 反向转向
+        // 脱困倒车阶段：倒车 + 反向转向（SBW 对履带/轮式的倒车转向均已自动反向）
         if (reverseTicks > 0) {
             reverseTicks--;
-            short key = pickTurnKey(vehicle, owner.getX(), owner.getZ(), true);
+            short key = pickTurnKey(vehicle, owner.getX(), owner.getZ(), true, profile.turnDeadzone());
             applyKeys(vehicle, (short) (KEY_BACK | key));
             return;
         }
@@ -202,11 +231,12 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
 
         // 到了：贴脸（任何情况）或进入跟随距离且能直视
         if (distSq <= FORCE_STOP_DIST * FORCE_STOP_DIST
-                || (distSq <= FOLLOW_STOP_DIST * FOLLOW_STOP_DIST && hasClearLine(level, vehicle, owner))) {
+                || (distSq <= profile.stopDist() * profile.stopDist() && hasClearLine(level, vehicle, owner))) {
             applyKeys(vehicle, (short) 0);
             resetStuck();
             path = List.of();
             pathIndex = 0;
+            pivotTicks = 0;
             return;
         }
 
@@ -226,20 +256,24 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
 
         double targetX;
         double targetZ;
+        double targetDistSq;
         if (path.isEmpty()) {
             // 无路可走：退回直线追踪（靠卡住脱困兜底）
             targetX = owner.getX();
             targetZ = owner.getZ();
+            targetDistSq = distSq;
         } else {
             // 推进已到达的航点
-            while (pathIndex < path.size() - 1 && reachedWaypoint(vehicle, path.get(pathIndex))) {
+            while (pathIndex < path.size() - 1
+                    && reachedWaypoint(vehicle, path.get(pathIndex), profile.waypointReach())) {
                 pathIndex++;
             }
             BlockPos wp = path.get(Math.min(pathIndex, path.size() - 1));
             targetX = wp.getX() + 0.5;
             targetZ = wp.getZ() + 0.5;
+            targetDistSq = distanceSqTo(vehicle, targetX, targetZ);
             // 最后一段：主人已在停车距离内且能直视，直接停车
-            if (distSq <= FOLLOW_STOP_DIST * FOLLOW_STOP_DIST && hasClearLine(level, vehicle, owner)) {
+            if (distSq <= profile.stopDist() * profile.stopDist() && hasClearLine(level, vehicle, owner)) {
                 applyKeys(vehicle, (short) 0);
                 resetStuck();
                 return;
@@ -247,19 +281,49 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         }
         replanTimer--;
 
-        short keys = pickTurnKey(vehicle, targetX, targetZ, false);
+        // ---- 转向 + 油门：按引擎类型分化 ----
+        short keys = pickTurnKey(vehicle, targetX, targetZ, false, profile.turnDeadzone());
         float yawErrAbs = Math.abs(yawErrorTo(vehicle, targetX, targetZ));
-        if (yawErrAbs < TURN_MAX_BEFORE_FORWARD) {
+        boolean wantForward;
+        if (yawErrAbs >= profile.pivotYawLimit()) {
+            // 大角度误差：履带原地转向（不踩油门），轮式必须带油门否则打不动方向
+            wantForward = !profile.pivotInPlace();
+        } else {
+            wantForward = true;
+        }
+        // 轮式高速接近时提前松油门滑行，避免冲过头
+        if (profile.coastDist() > 0 && targetDistSq <= profile.coastDist() * profile.coastDist()) {
+            wantForward = false;
+        }
+        // 原地转向超时保护：长时间没转正就强行给油，防止僵死
+        if (wantForward) {
+            pivotTicks = 0;
+        } else if (profile.pivotInPlace() && ++pivotTicks > profile.maxPivotTicks()) {
+            wantForward = true;
+            pivotTicks = 0;
+        }
+        if (wantForward) {
             keys |= KEY_FORWARD;
         }
         applyKeys(vehicle, keys);
         detectStuck(vehicle, keys);
     }
 
-    private static boolean reachedWaypoint(VehicleEntity vehicle, BlockPos wp) {
+    /** 按引擎类型取驾驶参数：履带可原地转，轮式/船/轮椅必须边走边转。 */
+    private static DriveProfile profileFor(VehicleEntity vehicle) {
+        return vehicle.computed().getEngineType() == EngineType.TRACK ? TRACK_PROFILE : WHEEL_PROFILE;
+    }
+
+    private static double distanceSqTo(VehicleEntity vehicle, double x, double z) {
+        double dx = x - vehicle.getX();
+        double dz = z - vehicle.getZ();
+        return dx * dx + dz * dz;
+    }
+
+    private static boolean reachedWaypoint(VehicleEntity vehicle, BlockPos wp, double reach) {
         double dx = wp.getX() + 0.5 - vehicle.getX();
         double dz = wp.getZ() + 0.5 - vehicle.getZ();
-        return dx * dx + dz * dz <= WAYPOINT_REACHED * WAYPOINT_REACHED;
+        return dx * dx + dz * dz <= reach * reach;
     }
 
     /** 两实体视点之间是否有方块阻挡（1.21.1 没有 Entity#hasLineOfSight）。 */
@@ -283,15 +347,15 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
      * 依据 yaw 误差取转向键。MC 中 yaw 增大 = 车头右转（南→西为左转，yaw 减小），
      * 故 err &gt; 0 打右键；若实测转向相反，只需交换两个返回值。
      */
-    private short pickTurnKey(VehicleEntity vehicle, double targetX, double targetZ, boolean invert) {
+    private short pickTurnKey(VehicleEntity vehicle, double targetX, double targetZ, boolean invert, float deadzone) {
         float yawErr = yawErrorTo(vehicle, targetX, targetZ);
         if (invert) {
             yawErr = -yawErr;
         }
-        if (yawErr > TURN_DEADZONE) {
+        if (yawErr > deadzone) {
             return KEY_RIGHT;
         }
-        if (yawErr < -TURN_DEADZONE) {
+        if (yawErr < -deadzone) {
             return KEY_LEFT;
         }
         return 0;
