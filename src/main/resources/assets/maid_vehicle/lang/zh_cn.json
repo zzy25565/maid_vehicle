@@ -1,0 +1,4 @@
+{
+    "task.maid_vehicle.drive_vehicle": "载具操控",
+    "task.maid_vehicle.drive_vehicle.desc": "女仆驾驶卓越前线载具跟随主人，主炮自动索敌开火；主人上车后，女仆会按优先级寻找载具（空载具 → 玩家载具副炮位 → 其他女仆载具副炮位 → 玩家载具搭车）。"
+}

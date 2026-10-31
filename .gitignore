@@ -1,0 +1,15 @@
+# Gradle
+build/
+.gradle/
+
+# 第三方依赖 jar（不随仓库分发，自行放入）
+libs/*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 系统
+Thumbs.db
+.DS_Store
