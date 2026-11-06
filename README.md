@@ -51,6 +51,55 @@
   **局部**按"目标方位角误差 → 左右键、距离 → 油门"的纯追踪控制行驶。
   每 30 tick 或主人移动超 6 格时重规划，撞墙卡住则丢弃路径强制重算。
 
+## PVP 阵营战接口（预留，默认关闭）
+
+> **状态：接口已就位，功能未应用。** 本仓库不注册任何实现，运行时女仆的敌我识别与 1.0.0d
+> 完全一致：只打 `Enemy` 怪物，以及最近攻击过主人 / 女仆自己的实体。**玩家永远不会被当作目标。**
+
+为将来的阵营战玩法留了两个公开扩展点（包 `com.zzy.maidvehicle.api`）：
+
+| 类 | 作用 |
+|---|---|
+| `FactionHostilityPolicy` | 策略接口：`isHostile(...)` 判敌对；`enableProactiveScan()` 是否允许主动索敌（默认 `false`） |
+| `FactionHostility` | 注册门面：`register` / `clear` / `get` / `isEnabled`；`policy == null` 即关闭 |
+
+钩子接在两处，缺一不可：
+
+- `DriveVehicleBehavior#isValidTarget`：基础安全过滤之后追加一次策略询问 → 管「能不能打」和「反击」；
+- `DriveVehicleBehavior#pickTarget` 的 AABB 主动扫描：候选谓词由 `e instanceof Enemy`
+  扩展为 `e instanceof Enemy || FactionHostility.isProactiveCandidate(...)` → 管「会不会主动找玩家打」。
+
+**基础安全过滤在策略之前已完成**，实现方不用重复：目标存活 / 非自己 / 非主人 / 非其他女仆 /
+非同车 / `isAlliedTo(maid)` / `isAlliedTo(owner)`（scoreboard 同队玩家在这里已被挡掉）/ 在最大索敌距离内。
+策略必须是纯判定、无副作用，会被高频调用。
+
+### 将来要启用时怎么做（现在不要做）
+
+1. 实现 `FactionHostilityPolicy`，用 scoreboard team / 自定义阵营数据判定敌对玩家；
+2. 需要女仆主动清场才把 `enableProactiveScan()` 覆写为 `true`，否则只保留「被打才还手」，
+   并自行处理出生点保护、中立玩家白名单；
+3. 在自己的模组初始化阶段调用 `FactionHostility.register(...)`，卸载 / 关服时 `clear()`；
+4. 双端同步部署，实机验证：同队不打、敌队打、误伤中立、驾驶员位与副炮位表现一致。
+
+示例（**仅示意，本仓库未启用**）：
+
+```java
+FactionHostility.register(new FactionHostilityPolicy() {
+    @Override
+    public boolean isHostile(LivingEntity candidate, EntityMaid maid,
+                             LivingEntity owner, VehicleEntity vehicle) {
+        if (!(candidate instanceof Player)) return false;
+        Team mine = owner.getTeam();
+        Team theirs = candidate.getTeam();
+        return mine != null && mine != theirs;
+    }
+    // 默认 false = 只反击，不主动索敌
+});
+```
+
+> 局域网离线模式（`online-mode=false`）下玩家 UUID 由服务端按名字生成并保持稳定，
+> 但改名会换 UUID；阵营数据若按 UUID 存储，需自行处理改名。
+
 ## 构建
 
 纯离线 javac 构建（不依赖 moddev/NFRT）：

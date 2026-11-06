@@ -3,6 +3,7 @@ package com.zzy.maidvehicle.ai;
 import com.atsuishio.superbwarfare.data.vehicle.subdata.EngineType;
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.zzy.maidvehicle.api.FactionHostility;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
@@ -33,7 +34,9 @@ import java.util.Set;
  *   <li><b>驾驶跟随</b>：女仆是第一个乘客（驾驶员）时，调用
  *       {@link VehicleEntity#processInput(short)} 追着主人开（SBW 的驾驶输入是纯服务端公开方法）；</li>
  *   <li><b>索敌开火</b>：设置女仆攻击目标（脑记忆 ATTACK_TARGET + setTarget）——
- *       SBW 对载具上的 Mob 自带弹道解算自动瞄准与按 RPM 自动开火，无需我们干预。</li>
+ *       SBW 对载具上的 Mob 自带弹道解算自动瞄准与按 RPM 自动开火，无需我们干预。
+ *       敌我识别默认只认怪物与反击来源；PVP 阵营战策略接口见
+ *       {@link com.zzy.maidvehicle.api.FactionHostility}（默认未注册、不生效）。</li>
  * </ol>
  *
  * <p>输入位编码与 SBW {@code VehicleMovementMessage} 一致：
@@ -540,11 +543,15 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
             return ownerAttacker;
         }
         // 4) 载具附近最近的敌对生物
+        //    PVP 预留：未注册策略时 isProactiveCandidate 恒 false，谓词退化为纯 instanceof Enemy
         AABB box = vehicle.getBoundingBox().inflate(TARGET_SEARCH_RANGE, 16, TARGET_SEARCH_RANGE);
         LivingEntity best = null;
         double bestDistSq = Double.MAX_VALUE;
         for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box,
-                e -> e.isAlive() && e instanceof Enemy && e != maid && e != owner
+                e -> e.isAlive()
+                        && (e instanceof Enemy
+                            || FactionHostility.isProactiveCandidate(e, maid, owner, vehicle))
+                        && e != maid && e != owner
                         && !e.isPassengerOfSameVehicle(maid))) {
             double d = vehicle.distanceToSqr(e);
             if (d < bestDistSq) {
@@ -568,7 +575,9 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         return t instanceof Enemy
                 || t == owner.getLastHurtMob()
                 || t == owner.getLastHurtByMob()
-                || t == maid.getLastHurtByMob();
+                || t == maid.getLastHurtByMob()
+                // PVP 阵营战预留：未注册策略时恒 false，不改变现有行为
+                || FactionHostility.isHostile(t, maid, owner, vehicle);
     }
 
     private void setTarget(EntityMaid maid, @Nullable LivingEntity target) {
