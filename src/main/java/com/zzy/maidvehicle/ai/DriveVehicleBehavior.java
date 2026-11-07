@@ -13,6 +13,7 @@ import net.minecraft.world.entity.ai.behavior.Behavior;
 import net.minecraft.world.entity.ai.behavior.BehaviorUtils;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.HitResult;
@@ -65,8 +66,18 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
 
     /** 寻路重规划周期（tick） */
     private static final int REPLAN_INTERVAL = 30;
+    /** A* 规划失败后的冷却（tick）：无路可走时不要每 tick 重采样整张栅格 */
+    private static final int PATH_FAILURE_COOLDOWN = 60;
     /** 目标移动超过该距离（格）时立刻重规划 */
     private static final double REPLAN_GOAL_MOVE = 6.0;
+
+    /**
+     * 轮式滑行减速的速度阈值（格/tick），做成滞回：
+     * 已有速度且接近航点才松油门，速度掉到下限就重新给油。
+     * 否则静止时会被"滑行"锁死，连 detectStuck 都因无前进输入而失效。
+     */
+    private static final double COAST_ENTER_SPEED = 0.12;
+    private static final double COAST_RESUME_SPEED = 0.04;
 
     /**
      * 按引擎类型分化的驾驶参数。
@@ -127,6 +138,8 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     private BlockPos lastGoal = null;
     /** 原地转向计时（履带专用，防止原地卡死） */
     private int pivotTicks = 0;
+    /** 轮式滑行状态（带速度滞回，防止临界速度反复切油门） */
+    private boolean coasting = false;
 
     public DriveVehicleBehavior() {
         // 10 分钟超时上限（超时会 stop 再 start，字段保留，无缝续跑）
@@ -194,6 +207,7 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         replanTimer = 0;
         lastGoal = null;
         pivotTicks = 0;
+        coasting = false;
     }
 
     // =====================================================================
@@ -244,16 +258,16 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         }
 
         // 规划 / 重规划（巷道绕障的核心）
+        // 不要把 path.isEmpty() 当重规划条件：寻路失败时会每 tick 重采样整张栅格。
+        // 成功/失败都由 replanTimer 节流；撞墙脱困会主动把 replanTimer 清零强制重算。
         BlockPos goalPos = owner.blockPosition();
-        boolean needReplan = path.isEmpty()
-                || pathIndex >= path.size()
-                || replanTimer <= 0
+        boolean needReplan = replanTimer <= 0
                 || lastGoal == null
                 || lastGoal.distSqr(goalPos) > REPLAN_GOAL_MOVE * REPLAN_GOAL_MOVE;
         if (needReplan) {
             path = VehiclePathfinder.findPath(level, vehicle, owner);
             pathIndex = 0;
-            replanTimer = REPLAN_INTERVAL;
+            replanTimer = path.isEmpty() ? PATH_FAILURE_COOLDOWN : REPLAN_INTERVAL;
             lastGoal = goalPos;
         }
 
@@ -294,9 +308,25 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         } else {
             wantForward = true;
         }
-        // 轮式高速接近时提前松油门滑行，避免冲过头
-        if (profile.coastDist() > 0 && targetDistSq <= profile.coastDist() * profile.coastDist()) {
-            wantForward = false;
+        // 轮式高速接近时提前松油门滑行，避免冲过头。
+        // 只有"已经在动"才允许滑行；静止时必须给油起步，否则车永远不动，
+        // 而且 detectStuck 会因为拿不到前进输入直接 reset，脱困也触发不了。
+        double speed = horizontalSpeed(vehicle);
+        boolean nearTarget = profile.coastDist() > 0
+                && targetDistSq <= profile.coastDist() * profile.coastDist();
+        if (profile.coastDist() > 0) {
+            if (coasting) {
+                if (speed <= COAST_RESUME_SPEED || !nearTarget) {
+                    coasting = false;
+                }
+            } else if (nearTarget && speed >= COAST_ENTER_SPEED) {
+                coasting = true;
+            }
+            if (coasting) {
+                wantForward = false;
+            }
+        } else {
+            coasting = false;
         }
         // 原地转向超时保护：长时间没转正就强行给油，防止僵死
         if (wantForward) {
@@ -315,6 +345,12 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
     /** 按引擎类型取驾驶参数：履带可原地转，轮式/船/轮椅必须边走边转。 */
     private static DriveProfile profileFor(VehicleEntity vehicle) {
         return vehicle.computed().getEngineType() == EngineType.TRACK ? TRACK_PROFILE : WHEEL_PROFILE;
+    }
+
+    /** 水平速度（格/tick）。SBW 轮式转向率正比于它，滑行判断也用它。 */
+    private static double horizontalSpeed(VehicleEntity vehicle) {
+        Vec3 v = vehicle.getDeltaMovement();
+        return Math.sqrt(v.x * v.x + v.z * v.z);
     }
 
     private static double distanceSqTo(VehicleEntity vehicle, double x, double z) {
@@ -436,8 +472,10 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
             if (pri <= 0) {
                 continue;
             }
-            // 同级内：血量高者优先（血量归一到 1000），其次距离近者优先
-            double score = pri * 1_000_000.0
+            // pri 越小优先级越高，但整体仍是"分数越大越优"，故取负号：
+            // 空载具(1) > 主人副炮位(2) > 其他女仆副炮位(3) > 主人搭车(4)。
+            // 同级内：血量高者优先（归一到 1000），其次距离近者优先。
+            double score = -pri * 1_000_000.0
                     + Math.min(v.getHealth(), 1000.0F) * 100.0
                     - maid.distanceTo(v);
             if (score > bestScore) {
@@ -542,8 +580,10 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         if (isValidTarget(ownerAttacker, maid, owner, vehicle)) {
             return ownerAttacker;
         }
-        // 4) 载具附近最近的敌对生物
-        //    PVP 预留：未注册策略时 isProactiveCandidate 恒 false，谓词退化为纯 instanceof Enemy
+        // 4) 载具附近最近的有效敌对目标
+        //    必须用与"目标有效性续期"完全相同的 isValidTarget 过滤，否则会选出
+        //    同盟 / 其他女仆 / 超距目标，setTarget 后下一轮又被判无效，来回抖动。
+        //    PVP 预留：未注册策略时 isProactiveCandidate 恒 false，谓词退化为纯 instanceof Enemy。
         AABB box = vehicle.getBoundingBox().inflate(TARGET_SEARCH_RANGE, 16, TARGET_SEARCH_RANGE);
         LivingEntity best = null;
         double bestDistSq = Double.MAX_VALUE;
@@ -551,8 +591,7 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
                 e -> e.isAlive()
                         && (e instanceof Enemy
                             || FactionHostility.isProactiveCandidate(e, maid, owner, vehicle))
-                        && e != maid && e != owner
-                        && !e.isPassengerOfSameVehicle(maid))) {
+                        && isValidTarget(e, maid, owner, vehicle))) {
             double d = vehicle.distanceToSqr(e);
             if (d < bestDistSq) {
                 bestDistSq = d;
@@ -571,6 +610,11 @@ public class DriveVehicleBehavior extends Behavior<EntityMaid> {
         }
         if (vehicle.distanceToSqr(t) > TARGET_MAX_RANGE * TARGET_MAX_RANGE) {
             return false;
+        }
+        // 玩家目标必须经阵营策略授权：主人打过的 / 打过主人或女仆的实体里也可能有玩家，
+        // 不单独拦的话，PVP 功能"未应用"时仍会把玩家设成攻击目标。
+        if (t instanceof Player) {
+            return FactionHostility.isHostile(t, maid, owner, vehicle);
         }
         return t instanceof Enemy
                 || t == owner.getLastHurtMob()
